@@ -51,6 +51,9 @@ NO_OBSTACLE_NPZ_DATA = {
     "twist",
     "twist_force",
     "twist_force_override",
+    # P005 macro-motion pretraining corpus. It has no PDB and no obstacle
+    # geometry, so this npz-only family is the only loader path that fits.
+    "macro_chain",
 }
 
 TOPOLOGY_ENABLED_DATA = {
@@ -359,6 +362,65 @@ def normalize_feats_cloth(feats):
 
     return feats_norm.astype(np.float32)
 
+# Relative floor on the mass spread, below which a column is treated as
+# uniform.  The official formula divides by ``std + 1e-8``, which is correct
+# when the spread is real but turns float32 round-off into O(1) noise when it is
+# not: a chain of 1000 identical nodes of mass 1e3 leaves a residual std around
+# 1e-4 after centering, and dividing by it manufactures a feature out of nothing.
+MASS_SPREAD_FLOOR = 1e-6
+
+
+def normalize_particle_mass(mass):
+    """Per-sample z-score of particle mass -> (N, 1) float32.
+
+    This is the cross-domain mass column shared by the P005 macro corpus and the
+    P004 RNA dataloader.  Both sides must call THIS function rather than reimplement
+    the formula: ``feats`` column semantics are not checked at runtime, so a
+    divergence between the two normalizations would be carried silently into the
+    transferred weights and show up only as a model that trains but does not work.
+
+    The formula is the one the official loader already uses for its single mass
+    column (see ``normalize_feats_cloth`` and the ``twist`` / ``elastic_drop``
+    branches of ``transform_particle_feats_by_data``), so pretrained weights see
+    the same input distribution they were trained on.  Being a z-score it is
+    dimensionless, which P005 requires: absolute macroscopic and molecular scales
+    are not comparable, and transfer only holds in the normalized space.
+
+    A uniform-mass sample returns an all-zero column.  That is the honest answer
+    -- a constant carries no per-particle information -- but it also means a
+    macro corpus built from uniform nodes would train this column at zero while
+    RNA feeds it a real spread.  The P005 generator therefore gives its nodes a
+    non-degenerate mass distribution; see docs/FEATS_CONTRACT.md in
+    research/macro-pretrain.
+    """
+    mass = np.asarray(mass, dtype=np.float64).reshape(-1)
+    mean = float(mass.mean())
+    std = float(mass.std())
+    if std <= MASS_SPREAD_FLOOR * max(abs(mean), 1e-12):
+        return np.zeros((mass.shape[0], 1), dtype=np.float32)
+    return ((mass - mean) / std).reshape(-1, 1).astype(np.float32)
+
+
+def normalize_feats_macro_chain(feats):
+    """P005 macro corpus: feats is (N, 1) raw node mass -> (N, 1) normalized.
+
+    The single-column shape is asserted rather than sliced.  Column order is a
+    cross-domain contract that nothing downstream validates, so a corpus written
+    with extra columns must fail loudly here instead of having column 0 silently
+    reinterpreted.
+    """
+    feats = np.asarray(feats)
+    if feats.ndim == 1:
+        feats = feats[:, None]
+    if feats.ndim != 2 or feats.shape[-1] != 1:
+        raise ValueError(
+            f"macro_chain expects feats of shape (N, 1) holding node mass, got {feats.shape}. "
+            "Adding a column requires updating both sides of the feats contract "
+            "(P005 plan section 3.3) before the data is regenerated."
+        )
+    return normalize_particle_mass(feats[:, 0])
+
+
 def transform_particle_feats_by_data(data, feats):
     if data in {"cloth_on_ball", "cloth_no_self_attention", "cloth_no_ffn", "cloth_no_all"}:
         return normalize_feats_cloth(feats)
@@ -386,6 +448,8 @@ def transform_particle_feats_by_data(data, feats):
         return (col_0 - np.mean(col_0, axis=0)) / (np.std(col_0, axis=0) + 1e-8)
     if data in {"real_world", "real_world_override", "duck_drop"}:
         return feats
+    if data == "macro_chain":
+        return normalize_feats_macro_chain(feats)
     if data in {"twist", "twist_force", "twist_force_override", "hair_ball"}:
         col_0 = feats[:, 0:1]
         return (col_0 - np.mean(col_0, axis=0)) / (np.std(col_0, axis=0) + 1e-8)
