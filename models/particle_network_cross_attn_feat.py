@@ -281,7 +281,9 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
                            fixed_radius_search_hash_table=None,
                            batch_info=None,
                            topology_neighbors_index=None,
-                           topology_neighbors_row_splits=None):
+                           topology_neighbors_row_splits=None,
+                           return_tokens: bool = False,
+                           skip_output_network: bool = False):
         """
         Compute position correction using slot attention and super-particle decoder.
 
@@ -300,9 +302,30 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
             box_feats: Obstacle/boundary features [M, Cb]
             fixed_radius_search_hash_table: Pre-computed spatial hash table (optional)
             batch_info: Optional batching information (currently unused)
+            return_tokens: Also return the per-particle tokens `h` -- the
+                super-particle decoder's output, taken before output_network.
+                Kineidos conditions Protenix's diffusion head on these.
+            skip_output_network: Only meaningful with return_tokens.  Stop after
+                the decoder instead of running WorldParticle's own
+                position/velocity head.
 
         Returns:
-            Position correction tensor [N, 3]
+            With return_tokens=False (the default, unchanged from upstream):
+                a tuple, `(pos_correction, vel_correction, super_particle_positions)`
+                when self.velhead else `(pos_correction, super_particle_positions)`.
+
+            With return_tokens=True: a dict, because the tuple's arity already
+                varies with self.velhead and adding a token entry to it would
+                make callers guess at positions.  Always has `tokens` and
+                `super_particle_positions`; has `pos_correction` (and
+                `vel_correction` when self.velhead) unless skip_output_network.
+
+        `skip_output_network` exists because the two callers want different
+        things.  With `wp.aux_next_frame_loss` on, output_network is reattached
+        as an auxiliary supervision head, so we need `h` *and* its next-frame
+        prediction -- the head still runs.  With the switch off nothing consumes
+        the prediction, and running the head would only build a graph that is
+        then discarded.  Hence a flag rather than an unconditional early return.
         """
         t2 = time.time()
         
@@ -387,6 +410,15 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
             print(f"Decoder processing time: {t6 - t5:.4f} seconds")
             import pdb; pdb.set_trace()
 
+        # Kineidos: `output_features` is the per-particle tokens h.  Squeeze the
+        # batch dim on the unbatched path so h follows the same convention as
+        # `out` below, which upstream squeezes under the same condition.
+        if return_tokens:
+            tokens = output_features.squeeze(0) if batch_info is None else output_features
+            if skip_output_network:
+                return {"tokens": tokens,
+                        "super_particle_positions": super_particle_positions_batch}
+
         # ============= Step 7: Generate Position Corrections =============
         # Pass decoder output through final network to get position corrections
         out = self.output_network(output_features)
@@ -412,6 +444,14 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
                 pos_correction = out.reshape(-1, 3)
                 pos_correction = pos_correction  * self.output_scale
         
+        if return_tokens:
+            result = {"tokens": tokens,
+                      "super_particle_positions": super_particle_positions_batch,
+                      "pos_correction": pos_correction}
+            if self.velhead:
+                result["vel_correction"] = vel_correction
+            return result
+
         if self.velhead:
             return pos_correction, vel_correction, super_particle_positions_batch
         else:
