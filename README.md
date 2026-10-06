@@ -77,7 +77,7 @@ For the complete `elastic_drag` path, each NPZ contains:
 - `neighbors_row_splits`: `[N + 1]` CSR row splits delimiting the topology neighbors of every particle.
 - `force`: `[T, N, 3]` external force applied during physics integration.
 
-`elastic_drag` belongs to the obstacle, topology-enabled, and force-trajectory data groups in `TrajDataset.py`. Providing all arrays above exercises the complete local-feature path: fluid-fluid continuous convolution, fluid-obstacle continuous convolution, topology convolution, and force-aware integration. The topology graph and obstacle tensors are static for a sample, while position, velocity, and force are indexed by frame.
+`elastic_drag` belongs to the obstacle, topology-enabled, and force-trajectory data groups in `TrajDataset.py`. Providing all arrays above exercises the complete local-feature path: molecular-molecular continuous convolution, molecular-obstacle continuous convolution, topology convolution, and force-aware integration. The topology graph and obstacle tensors are static for a sample, while position, velocity, and force are indexed by frame.
 
 Other NPZ data types may omit `box`/`box_feats`, topology arrays, or `force` when their data-group rules do not use them. The checked-in `config.yaml` currently uses `fancy_fluid`; change its `data` field and data root when running the `elastic_drag` example.
 
@@ -148,7 +148,7 @@ With `k_partite: k`, each merge iteration reduces the token count to approximate
 | `cconv_embedding_dim` | Per-branch local feature dimension. |
 | `use_topology_conv` | `null` uses the built-in data-type rule; a boolean overrides it. |
 | `topology_search_radius` | `null` uses the data-type default; a number overrides it. |
-| `topology_blend_alpha` | When topology is enabled, `null` concatenates fluid and topology branches, `0` is topology-only, and `1` is fluid-only. |
+| `topology_blend_alpha` | When topology is enabled, `null` concatenates molecular and topology branches, `0` is topology-only, and `1` is molecular-only. |
 
 `coordinate_mapping`, `interpolation`, and `use_window` exist in `config.yaml`, but the `TrajectoryModel` wrapper does not forward them into the model constructor. The active path therefore uses the model defaults: `ball_to_cube_volume_preserving`, `linear`, and `true`.
 

@@ -108,7 +108,7 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
         )
         
         # ============= Calculate Feature Dimensions =============
-        # Combined dimension: obstacle conv + fluid conv + dense layer
+        # Combined dimension: obstacle conv + molecular conv + dense layer
         if self.data == "local_fluid":
             combined_feat_dim = cconv_embedding_dim * 3
         elif uses_obstacle_features(self.data):
@@ -306,7 +306,7 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
         """
         t2 = time.time()
         
-        particle_features, num_fluid_neighbors, _ = self.local_feature_extractor(
+        particle_features, num_molecular_neighbors, _ = self.local_feature_extractor(
             inp_pos=pos, query_pos=pos, inp_vel=vel, other_feats=other_feats,
             box=box, box_feats=box_feats,
             fixed_radius_search_hash_table=fixed_radius_search_hash_table,
@@ -314,14 +314,14 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
             topology_neighbors_index=topology_neighbors_index,
             topology_neighbors_row_splits=topology_neighbors_row_splits)
 
-        if num_fluid_neighbors is None:
-            self.num_fluid_neighbors = torch.zeros(
+        if num_molecular_neighbors is None:
+            self.num_molecular_neighbors = torch.zeros(
                 particle_features.shape[0],
                 dtype=particle_features.dtype,
                 device=particle_features.device,
             )
         else:
-            self.num_fluid_neighbors = num_fluid_neighbors # for loss calculation
+            self.num_molecular_neighbors = num_molecular_neighbors # for loss calculation
 
         t3 = time.time()
         if self.verbose:

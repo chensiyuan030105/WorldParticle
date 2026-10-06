@@ -6,7 +6,7 @@ import yaml
 import mdtraj as md
 from trajectory_model import TrajectoryModel
 from TrajDataset import (
-    load_fluid_sample_by_data,
+    load_molecular_sample_by_data,
     load_trajectory_sample_by_data,
     load_npz_sample_by_data,
     is_obstacle_npz_data,
@@ -72,7 +72,7 @@ def inference(args, cfg):
         )
     elif cfg["data"] == "fluid":
         data_path = os.path.join(args.data_dir, "train")
-        sample = load_fluid_sample_by_data(
+        sample = load_molecular_sample_by_data(
             data_path=data_path,
             sim_name=args.sample,
             start_idx=0,

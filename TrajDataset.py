@@ -119,7 +119,7 @@ def _read_msgpack_zst(file_path):
         decompressed = dctx.decompress(f.read())
     return msgpack.unpackb(decompressed, raw=False)
 
-def load_from_fluid(
+def load_from_molecular(
     base_path,
     sim_prefix,
     start_idx,
@@ -435,7 +435,7 @@ def infer_other_feats_channels(
         data_path = os.path.join(data_folder, data_list)
         for name in name_list:
             try:
-                sample = load_fluid_sample_by_data(
+                sample = load_molecular_sample_by_data(
                     data_path=data_path,
                     sim_name=name,
                     start_idx=0,
@@ -522,7 +522,7 @@ def infer_obstacle_feats_channels(
         data_path = os.path.join(data_folder, data_list)
         for name in name_list:
             try:
-                sample = load_fluid_sample_by_data(
+                sample = load_molecular_sample_by_data(
                     data_path=data_path,
                     sim_name=name,
                     start_idx=0,
@@ -556,13 +556,13 @@ def infer_obstacle_feats_channels(
 
     raise ValueError(f"Failed to infer obstacle_feats_channels from data type={data_type}.")
 
-def load_fluid_sample_by_data(
+def load_molecular_sample_by_data(
     data_path,
     sim_name,
     start_idx=0,
     end_idx=15,
 ):
-    positions, velocities, feats, box, box_feats = load_from_fluid(
+    positions, velocities, feats, box, box_feats = load_from_molecular(
         base_path=data_path,
         sim_prefix=sim_name,
         start_idx=start_idx,
@@ -786,7 +786,7 @@ class TrajDataset(Dataset):
         elif data == "fluid":
             for name in tqdm(name_list, desc="Loading fluid xyz"):
                 data_path = os.path.join(data_folder, data_list)
-                sample = load_fluid_sample_by_data(
+                sample = load_molecular_sample_by_data(
                     data_path=data_path,
                     sim_name=name,
                     start_idx=0,

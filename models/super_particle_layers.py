@@ -163,7 +163,7 @@ class LocalFeatureExtractor(torch.nn.Module):
         self.particle_radius = particle_radius
         self.other_feats_channels = other_feats_channels
         self.obstacle_feats_channels = obstacle_feats_channels
-        self.is_local_fluid = self.data == "local_fluid"
+        self.is_local_molecular = self.data == "local_fluid"
         self.topology_blend_alpha = topology_blend_alpha
         self.filter_extent = np.float32(self.radius_scale * 6 * self.particle_radius)
         self.use_topology_conv = bool(use_topology_conv)
@@ -183,13 +183,13 @@ class LocalFeatureExtractor(torch.nn.Module):
                 if alpha_fixed not in (0.0, 1.0):
                     raise ValueError(
                         "topology_blend_alpha now only supports null/0/1: "
-                        "null=concat(auto), 0=topology-only, 1=fluid-only."
+                        "null=concat(auto), 0=topology-only, 1=molecular-only."
                     )
                 self.topology_alpha_fixed = alpha_fixed
                 if alpha_fixed == 0.0:
                     self.topology_fusion_mode = "topology_only"
                 else:
-                    self.topology_fusion_mode = "fluid_only"
+                    self.topology_fusion_mode = "molecular_only"
         if self.topology_search_radius is None:
             self.topology_filter_extent = self.filter_extent
         else:
@@ -223,20 +223,20 @@ class LocalFeatureExtractor(torch.nn.Module):
             )
             return conv
 
-        # Fluid-fluid convolution: particle-particle interactions
-        fluid_conv_out_channels = cconv_embedding_dim
+        # Molecular-molecular convolution: particle-particle interactions
+        molecular_conv_out_channels = cconv_embedding_dim
         topology_conv_out_channels = cconv_embedding_dim
         if self.topology_fusion_mode == "concat":
             if cconv_embedding_dim % 2 != 0:
                 raise ValueError(
                     f"cconv_embedding_dim must be even for topology concat mode, got {cconv_embedding_dim}"
                 )
-            fluid_conv_out_channels = cconv_embedding_dim // 2
+            molecular_conv_out_channels = cconv_embedding_dim // 2
             topology_conv_out_channels = cconv_embedding_dim // 2
 
-        self.conv0_fluid = Conv(
+        self.conv0_molecular = Conv(
             in_channels=4 + other_feats_channels,
-            filters=fluid_conv_out_channels,
+            filters=molecular_conv_out_channels,
             activation=None
         )
         if self.use_topology_conv:
@@ -246,7 +246,7 @@ class LocalFeatureExtractor(torch.nn.Module):
                 activation=None
             )
 
-        # Fluid-obstacle convolution: particle-boundary interactions
+        # Molecular-obstacle convolution: particle-boundary interactions
         if uses_obstacle_features(self.data):
             self.conv0_obstacle = Conv(
                 in_channels=obstacle_feats_channels,
@@ -255,14 +255,14 @@ class LocalFeatureExtractor(torch.nn.Module):
             )
 
         # Dense layer for direct feature transformation
-        dense0_in_features = 7 + other_feats_channels if self.is_local_fluid else 4 + other_feats_channels
-        dense0_out_features = 3 * cconv_embedding_dim if self.is_local_fluid else cconv_embedding_dim
-        self.dense0_fluid = nn.Linear(
+        dense0_in_features = 7 + other_feats_channels if self.is_local_molecular else 4 + other_feats_channels
+        dense0_out_features = 3 * cconv_embedding_dim if self.is_local_molecular else cconv_embedding_dim
+        self.dense0_molecular = nn.Linear(
             in_features=dense0_in_features,
             out_features=dense0_out_features
         )
-        nn.init.xavier_uniform_(self.dense0_fluid.weight)
-        nn.init.zeros_(self.dense0_fluid.bias)
+        nn.init.xavier_uniform_(self.dense0_molecular.weight)
+        nn.init.zeros_(self.dense0_molecular.bias)
         
         self.register_buffer(
             "filter_extent_tensor",
@@ -284,19 +284,19 @@ class LocalFeatureExtractor(torch.nn.Module):
         filter_extent = self.filter_extent_tensor
         topology_filter_extent = self.topology_filter_extent_tensor
 
-        if self.is_local_fluid:
-            fluid_feats = [torch.ones_like(inp_pos[:, 0:1]), inp_vel, inp_pos]
+        if self.is_local_molecular:
+            molecular_feats = [torch.ones_like(inp_pos[:, 0:1]), inp_vel, inp_pos]
             if other_feats is not None:
                 if other_feats.dim() == 1:
                     other_feats = other_feats.unsqueeze(-1)
-                fluid_feats.append(other_feats)
-            fluid_feats = torch.cat(fluid_feats, axis=-1)
-            dense0_fluid_out = self.dense0_fluid(fluid_feats)
-            particle_features = dense0_fluid_out
+                molecular_feats.append(other_feats)
+            molecular_feats = torch.cat(molecular_feats, axis=-1)
+            dense0_molecular_out = self.dense0_molecular(molecular_feats)
+            particle_features = dense0_molecular_out
             return particle_features, None, None
 
         # ============= Step 1: Neighbor Search =============
-        # Find fluid-fluid neighbors (particle-particle interactions)
+        # Find molecular-molecular neighbors (particle-particle interactions)
         if batch_info is not None:
             batch_size = batch_info['batch_size']
             batch_splits = batch_info['batch_splits'].to(
@@ -308,7 +308,7 @@ class LocalFeatureExtractor(torch.nn.Module):
                     f"got {batch_splits.numel()}"
                 )
 
-            fluid_fluid_nns = self.particle_radius_search(
+            molecular_molecular_nns = self.particle_radius_search(
                 inp_positions=inp_pos,
                 out_positions=query_pos,
                 extents=filter_extent,
@@ -327,7 +327,7 @@ class LocalFeatureExtractor(torch.nn.Module):
                         f"got {box_splits.numel()}"
                     )
 
-                fluid_obstacle_nns = self.particle_radius_search(
+                molecular_obstacle_nns = self.particle_radius_search(
                     inp_positions=box,
                     out_positions=query_pos,
                     extents=filter_extent,
@@ -337,37 +337,37 @@ class LocalFeatureExtractor(torch.nn.Module):
                 )
                 
         else:
-            fluid_fluid_nns = self.particle_radius_search(
+            molecular_molecular_nns = self.particle_radius_search(
                 inp_positions=inp_pos,
                 out_positions=query_pos,
                 extents=filter_extent,
                 fixed_radius_search_hash_table=fixed_radius_search_hash_table)
             if uses_obstacle_features(self.data):
-                # Find fluid-obstacle neighbors (particle-boundary interactions)
-                fluid_obstacle_nns = self.particle_radius_search(
+                # Find molecular-obstacle neighbors (particle-boundary interactions)
+                molecular_obstacle_nns = self.particle_radius_search(
                     inp_positions=box,
                     out_positions=query_pos,
                     extents=filter_extent,
                     fixed_radius_search_hash_table=fixed_radius_search_hash_table)
 
         # ============= Step 2: Feature Extraction via Continuous Convolutions =============
-        # Prepare fluid particle features: [1, velocities, other_features]
-        fluid_feats = [torch.ones_like(inp_pos[:, 0:1]), inp_vel]  # Add constant feature for bias
+        # Prepare molecular particle features: [1, velocities, other_features]
+        molecular_feats = [torch.ones_like(inp_pos[:, 0:1]), inp_vel]  # Add constant feature for bias
         if other_feats is not None:
             if other_feats.dim() == 1:
                 other_feats = other_feats.unsqueeze(-1)
-            fluid_feats.append(other_feats)
-        fluid_feats = torch.cat(fluid_feats, axis=-1)
+            molecular_feats.append(other_feats)
+        molecular_feats = torch.cat(molecular_feats, axis=-1)
 
-        # Extract fluid branch first when required by fusion mode.
-        conv0_fluid_out = None
-        if self.topology_fusion_mode in {"disabled", "concat", "fluid_only"}:
-            conv0_fluid_out = self.conv0_fluid(
-                fluid_feats, inp_pos, query_pos, filter_extent,
-                inp_importance=fluid_fluid_nns['inp_importance'],
-                neighbors_index=fluid_fluid_nns['neighbors_index'],
-                neighbors_row_splits=fluid_fluid_nns['neighbors_row_splits'],
-                neighbors_importance=fluid_fluid_nns['neighbors_importance'])
+        # Extract molecular branch first when required by fusion mode.
+        conv0_molecular_out = None
+        if self.topology_fusion_mode in {"disabled", "concat", "molecular_only"}:
+            conv0_molecular_out = self.conv0_molecular(
+                molecular_feats, inp_pos, query_pos, filter_extent,
+                inp_importance=molecular_molecular_nns['inp_importance'],
+                neighbors_index=molecular_molecular_nns['neighbors_index'],
+                neighbors_row_splits=molecular_molecular_nns['neighbors_row_splits'],
+                neighbors_importance=molecular_molecular_nns['neighbors_importance'])
 
         topology_neighbors_available = (
             self.use_topology_conv
@@ -402,45 +402,45 @@ class LocalFeatureExtractor(torch.nn.Module):
                 )
             )
             conv0_topology_out = self.conv0_topology(
-                fluid_feats, inp_pos, query_pos, topology_filter_extent,
+                molecular_feats, inp_pos, query_pos, topology_filter_extent,
                 inp_importance=topology_nns['inp_importance'],
                 neighbors_index=topology_nns['neighbors_index'],
                 neighbors_row_splits=topology_nns['neighbors_row_splits'],
                 neighbors_importance=topology_nns['neighbors_importance'])
 
-        # Topology + fluid fusion policy:
-        # - disabled: fluid-only
-        # - concat: [fluid_half, topology_half] -> cconv_embedding_dim
+        # Topology + molecular fusion policy:
+        # - disabled: molecular-only
+        # - concat: [molecular_half, topology_half] -> cconv_embedding_dim
         # - topology_only: use topology branch only (alpha=0)
-        # - fluid_only: use fluid branch only (alpha=1)
+        # - molecular_only: use molecular branch only (alpha=1)
         if self.topology_fusion_mode == "concat":
-            if conv0_fluid_out is None:
-                raise ValueError("concat mode expects fluid branch output, got None.")
+            if conv0_molecular_out is None:
+                raise ValueError("concat mode expects molecular branch output, got None.")
             if conv0_topology_out is None:
-                conv0_topology_out = torch.zeros_like(conv0_fluid_out)
-            conv0_fluid_out = torch.cat([conv0_fluid_out, conv0_topology_out], dim=-1)
+                conv0_topology_out = torch.zeros_like(conv0_molecular_out)
+            conv0_molecular_out = torch.cat([conv0_molecular_out, conv0_topology_out], dim=-1)
         elif self.topology_fusion_mode == "topology_only":
             if conv0_topology_out is None:
                 raise ValueError(
                     "topology_blend_alpha=0 requires topology neighbors, "
                     "but topology neighbors are missing in the current batch."
                 )
-            conv0_fluid_out = conv0_topology_out
-        elif self.topology_fusion_mode == "fluid_only":
-            if conv0_fluid_out is None:
-                raise ValueError("topology_blend_alpha=1 expects fluid branch output, got None.")
+            conv0_molecular_out = conv0_topology_out
+        elif self.topology_fusion_mode == "molecular_only":
+            if conv0_molecular_out is None:
+                raise ValueError("topology_blend_alpha=1 expects molecular branch output, got None.")
         elif self.topology_fusion_mode == "disabled":
-            if conv0_fluid_out is None:
-                raise ValueError("topology disabled mode expects fluid branch output, got None.")
+            if conv0_molecular_out is None:
+                raise ValueError("topology disabled mode expects molecular branch output, got None.")
         else:
             raise ValueError(f"Unsupported topology_fusion_mode={self.topology_fusion_mode}")
 
         # Dense layer: Direct transformation of particle features
         if query_vel is not None:
-            query_fluid_feats = [torch.ones_like(query_pos[:, 0:1]), query_vel]
-            dense0_fluid_out = self.dense0_fluid(torch.cat(query_fluid_feats, axis=-1))
+            query_molecular_feats = [torch.ones_like(query_pos[:, 0:1]), query_vel]
+            dense0_molecular_out = self.dense0_molecular(torch.cat(query_molecular_feats, axis=-1))
         else:
-            dense0_fluid_out = self.dense0_fluid(fluid_feats)
+            dense0_molecular_out = self.dense0_molecular(molecular_feats)
 
         if uses_obstacle_features(self.data):
             if box_feats is None:
@@ -455,32 +455,32 @@ class LocalFeatureExtractor(torch.nn.Module):
                     f"expected {self.obstacle_feats_channels}. "
                     "Set `obstacle_feats_channels` to match your data."
                 )
-        # Fluid-obstacle convolution: Extract features from boundary interactions
+        # Molecular-obstacle convolution: Extract features from boundary interactions
             conv0_obstacle_out = self.conv0_obstacle(
                 box_feats, box, query_pos, filter_extent,
-                inp_importance=fluid_obstacle_nns['inp_importance'],
-                neighbors_index=fluid_obstacle_nns['neighbors_index'],
-                neighbors_row_splits=fluid_obstacle_nns['neighbors_row_splits'],
-                neighbors_importance=fluid_obstacle_nns['neighbors_importance'])
+                inp_importance=molecular_obstacle_nns['inp_importance'],
+                neighbors_index=molecular_obstacle_nns['neighbors_index'],
+                neighbors_row_splits=molecular_obstacle_nns['neighbors_row_splits'],
+                neighbors_importance=molecular_obstacle_nns['neighbors_importance'])
 
             # Combine all extracted features
             particle_features = torch.cat([
                 conv0_obstacle_out,  # Boundary interaction features
-                conv0_fluid_out,     # Particle-particle features
-                dense0_fluid_out,    # Direct particle features
+                conv0_molecular_out,     # Particle-particle features
+                dense0_molecular_out,    # Direct particle features
             ], axis=-1)  # Shape: [N, combined_feat_dim]
 
         else:
             particle_features = torch.cat([
-                conv0_fluid_out,     # Particle-particle features
-                dense0_fluid_out,    # Direct particle features
+                conv0_molecular_out,     # Particle-particle features
+                dense0_molecular_out,    # Direct particle features
             ], axis=-1)
         
-        num_fluid_neighbors = reduce_subarrays_sum(
-            torch.ones_like(fluid_fluid_nns['neighbors_index'], dtype=torch.float32),
-            fluid_fluid_nns['neighbors_row_splits']
+        num_molecular_neighbors = reduce_subarrays_sum(
+            torch.ones_like(molecular_molecular_nns['neighbors_index'], dtype=torch.float32),
+            molecular_molecular_nns['neighbors_row_splits']
         )
-        return particle_features, num_fluid_neighbors, fluid_fluid_nns
+        return particle_features, num_molecular_neighbors, molecular_molecular_nns
         
 
 class SuperParticleLocalFeatureExtractor(torch.nn.Module):
@@ -538,14 +538,14 @@ class SuperParticleLocalFeatureExtractor(torch.nn.Module):
             )
             return conv
 
-        # Fluid-fluid convolution: particle-particle interactions
-        self.conv0_fluid = Conv(
+        # Molecular-molecular convolution: particle-particle interactions
+        self.conv0_molecular = Conv(
             in_channels=4 + other_feats_channels,
             filters=cconv_embedding_dim,
             activation=None
         )
 
-        # Fluid-obstacle convolution: particle-boundary interactions
+        # Molecular-obstacle convolution: particle-boundary interactions
         self.conv0_obstacle = Conv(
             in_channels=3,
             filters=cconv_embedding_dim,
@@ -553,81 +553,81 @@ class SuperParticleLocalFeatureExtractor(torch.nn.Module):
         )
 
         # Dense layer for direct feature transformation
-        self.dense0_fluid = nn.Linear(
+        self.dense0_molecular = nn.Linear(
             in_features=4 + other_feats_channels,
             out_features=cconv_embedding_dim
         )
-        nn.init.xavier_uniform_(self.dense0_fluid.weight)
-        nn.init.zeros_(self.dense0_fluid.bias)
+        nn.init.xavier_uniform_(self.dense0_molecular.weight)
+        nn.init.zeros_(self.dense0_molecular.bias)
     
     def forward(self, inp_pos, query_pos, inp_vel, other_feats, box, box_feats, query_vel=None,
                 inp_pos_hash_table=None, box_hash_table=None):
         filter_extent = torch.tensor(self.filter_extent, device=inp_pos.device, dtype=inp_pos.dtype)
         # ============= Step 1: Neighbor Search =============
-        # Find fluid-fluid neighbors (particle-particle interactions)
+        # Find molecular-molecular neighbors (particle-particle interactions)
         if inp_pos_hash_table is not None:
-            fluid_fluid_nns = self.particle_radius_search(
+            molecular_molecular_nns = self.particle_radius_search(
                 inp_positions=inp_pos,
                 out_positions=query_pos,
                 extents=filter_extent,
                 fixed_radius_search_hash_table=inp_pos_hash_table)
         else:
-            fluid_fluid_nns, inp_pos_hash_table = self.particle_radius_search(
+            molecular_molecular_nns, inp_pos_hash_table = self.particle_radius_search(
                 inp_positions=inp_pos,
                 out_positions=query_pos,
                 extents=filter_extent,
                 return_hash_table=True)
 
-        # Find fluid-obstacle neighbors (particle-boundary interactions)
+        # Find molecular-obstacle neighbors (particle-boundary interactions)
         if box_hash_table is not None:
-            fluid_obstacle_nns = self.particle_radius_search(
+            molecular_obstacle_nns = self.particle_radius_search(
                 inp_positions=box,
                 out_positions=query_pos,
                 extents=filter_extent,
                 fixed_radius_search_hash_table=box_hash_table)
         else:
-            fluid_obstacle_nns, box_hash_table = self.particle_radius_search(
+            molecular_obstacle_nns, box_hash_table = self.particle_radius_search(
                 inp_positions=box,
                 out_positions=query_pos,
                 extents=filter_extent,
                 return_hash_table=True)
 
         # ============= Step 2: Feature Extraction via Continuous Convolutions =============
-        # Prepare fluid particle features: [1, velocities, other_features]
-        fluid_feats = [torch.ones_like(inp_pos[:, 0:1]), inp_vel]  # Add constant feature for bias
+        # Prepare molecular particle features: [1, velocities, other_features]
+        molecular_feats = [torch.ones_like(inp_pos[:, 0:1]), inp_vel]  # Add constant feature for bias
         if other_feats is not None:
-            fluid_feats.append(other_feats)
-        fluid_feats = torch.cat(fluid_feats, axis=-1)
+            molecular_feats.append(other_feats)
+        molecular_feats = torch.cat(molecular_feats, axis=-1)
 
         # Extract features using continuous convolutions
-        # Fluid-fluid convolution: Extract features from neighboring particles
-        conv0_fluid_out = self.conv0_fluid(
-            fluid_feats, inp_pos, query_pos, filter_extent,
-            inp_importance=fluid_fluid_nns['inp_importance'],
-            neighbors_index=fluid_fluid_nns['neighbors_index'],
-            neighbors_row_splits=fluid_fluid_nns['neighbors_row_splits'],
-            neighbors_importance=fluid_fluid_nns['neighbors_importance'])
+        # Molecular-molecular convolution: Extract features from neighboring particles
+        conv0_molecular_out = self.conv0_molecular(
+            molecular_feats, inp_pos, query_pos, filter_extent,
+            inp_importance=molecular_molecular_nns['inp_importance'],
+            neighbors_index=molecular_molecular_nns['neighbors_index'],
+            neighbors_row_splits=molecular_molecular_nns['neighbors_row_splits'],
+            neighbors_importance=molecular_molecular_nns['neighbors_importance'])
 
         # Dense layer: Direct transformation of particle features
         if query_vel is not None:
-            query_fluid_feats = [torch.ones_like(query_pos[:, 0:1]), query_vel]
-            dense0_fluid_out = self.dense0_fluid(torch.cat(query_fluid_feats, axis=-1))
+            query_molecular_feats = [torch.ones_like(query_pos[:, 0:1]), query_vel]
+            dense0_molecular_out = self.dense0_molecular(torch.cat(query_molecular_feats, axis=-1))
         else:
-            dense0_fluid_out = self.dense0_fluid(fluid_feats)
+            dense0_molecular_out = self.dense0_molecular(molecular_feats)
 
-        # Fluid-obstacle convolution: Extract features from boundary interactions
+        # Molecular-obstacle convolution: Extract features from boundary interactions
         conv0_obstacle_out = self.conv0_obstacle(
             box_feats, box, query_pos, filter_extent,
-            inp_importance=fluid_obstacle_nns['inp_importance'],
-            neighbors_index=fluid_obstacle_nns['neighbors_index'],
-            neighbors_row_splits=fluid_obstacle_nns['neighbors_row_splits'],
-            neighbors_importance=fluid_obstacle_nns['neighbors_importance'])
+            inp_importance=molecular_obstacle_nns['inp_importance'],
+            neighbors_index=molecular_obstacle_nns['neighbors_index'],
+            neighbors_row_splits=molecular_obstacle_nns['neighbors_row_splits'],
+            neighbors_importance=molecular_obstacle_nns['neighbors_importance'])
 
         # Combine all extracted features
         particle_features = torch.cat([
             conv0_obstacle_out,  # Boundary interaction features
-            conv0_fluid_out,     # Particle-particle features
-            dense0_fluid_out,    # Direct particle features
+            conv0_molecular_out,     # Particle-particle features
+            dense0_molecular_out,    # Direct particle features
         ], axis=-1)  # Shape: [N, combined_feat_dim]
         
         return particle_features, inp_pos_hash_table, box_hash_table
