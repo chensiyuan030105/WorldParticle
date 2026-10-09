@@ -72,6 +72,7 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
             distance_bias_cutoff=2.0,
             distance_bias_num_basis=16,
             normalize_other_feats=True,
+            normalize_feature_branches=True,
 
             # ============= Debug Parameters =============
             verbose=False,
@@ -122,6 +123,7 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
             other_feats_channels=other_feats_channels,
             obstacle_feats_channels=obstacle_feats_channels,
             normalize_other_feats=normalize_other_feats,
+            normalize_feature_branches=normalize_feature_branches,
         )
         
         # ============= Calculate Feature Dimensions =============
@@ -149,8 +151,11 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
         # modules rather than one because the pairs are different kinds --
         # atom-to-super-particle for the cross-attention, atom-to-atom for the
         # self-attention -- and sharing weights would force one radial profile
-        # on both.  Both are zero-initialised on their output layer, so at
-        # random initialisation the decoder is exactly content attention.
+        # on both.  Randomly initialised, not zero: with a zero bias 470 query
+        # atoms attend to 7 super-particles with nothing distinguishing the
+        # pairs, so every atom receives the same mixture and `h` comes out a
+        # cross-atom constant.  Measured -- see models/invariant.py's
+        # DistanceBias.__init__.
         self.decoder_cross_bias = DistanceBias(
             n_heads=decoder_attn_heads,
             cutoff=self.distance_bias_cutoff,

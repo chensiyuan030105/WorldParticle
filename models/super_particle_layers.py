@@ -151,6 +151,7 @@ class LocalFeatureExtractor(torch.nn.Module):
             obstacle_feats_channels=3,
             topology_blend_alpha=None,
             normalize_other_feats=True,
+            normalize_feature_branches=True,
     ):
         super().__init__()
 
@@ -309,6 +310,40 @@ class LocalFeatureExtractor(torch.nn.Module):
             self.other_feats_norm = nn.LayerNorm(other_feats_channels)
         else:
             self.other_feats_norm = None
+
+        # **The same rule, one concat later, and it is the one that mattered.**
+        # `particle_features = cat([conv0_out, dense0_out])` puts two branches
+        # with completely different content side by side:
+        #   conv0_molecular consumes positions (as the neighbour graph and the
+        #     distances), so it is the *only* place in WorldParticle where
+        #     conformation enters at all;
+        #   dense0_molecular consumes [ones, vel, other_feats] and no
+        #     positions, so it is pure atom identity -- by construction, not
+        #     by accident.
+        # The checkup measured what happens when they are concatenated raw
+        # (plan 5.3, 2026-10-09, random init, 8 held-out windows): between two
+        # conformations of the same molecule the per-atom cosine is 0.9938 at
+        # conv0_molecular and **0.999991** at the concat.  A 690x dilution, in
+        # one `torch.cat`.
+        #
+        # And it is a dilution D2 *created*.  Under the old contract
+        # `other_feats` was a single constant, so dense0's output was a
+        # cross-atom constant and contributed no per-atom magnitude at all.
+        # Filling that slot with 17 channels of strong identity fixed "h is a
+        # constant" (1.57e-07 -> 54%) and immediately bought "h is per-atom but
+        # says nothing about the conformation".  Two bugs of the same shape, and
+        # STAR-MD's A12 is the fix for both: normalise each branch before the
+        # concat, because a norm afterwards cannot undo the imbalance.
+        self.normalize_feature_branches = bool(normalize_feature_branches)
+        if self.normalize_feature_branches:
+            self.conv_branch_norm = nn.LayerNorm(molecular_conv_out_channels
+                                                 if self.topology_fusion_mode
+                                                 != "concat"
+                                                 else cconv_embedding_dim)
+            self.dense_branch_norm = nn.LayerNorm(dense0_out_features)
+        else:
+            self.conv_branch_norm = None
+            self.dense_branch_norm = None
         
         self.register_buffer(
             "filter_extent_tensor",
@@ -350,6 +385,9 @@ class LocalFeatureExtractor(torch.nn.Module):
                 topology_neighbors_row_splits=None):
         filter_extent = self.filter_extent_tensor
         topology_filter_extent = self.topology_filter_extent_tensor
+        # Reset per call, not accumulated: a stale entry from a previous
+        # forward would be reported as this one's.
+        self._branch_rms = {}
 
         if self.is_local_molecular:
             molecular_feats = [torch.ones_like(inp_pos[:, 0:1]), inp_vel, inp_pos]
@@ -546,6 +584,17 @@ class LocalFeatureExtractor(torch.nn.Module):
             ], axis=-1)  # Shape: [N, combined_feat_dim]
 
         else:
+            # Per-branch LayerNorm before the concat -- see the constructor.
+            # The rms of each branch is recorded so the ratio this fixes is
+            # visible in the checkup rather than having to be inferred.
+            self._branch_rms["conv0_out"] = float(
+                conv0_molecular_out.detach().float().pow(2).mean().sqrt())
+            self._branch_rms["dense0_out"] = float(
+                dense0_molecular_out.detach().float().pow(2).mean().sqrt())
+            if self.conv_branch_norm is not None:
+                conv0_molecular_out = self.conv_branch_norm(conv0_molecular_out)
+                dense0_molecular_out = self.dense_branch_norm(
+                    dense0_molecular_out)
             particle_features = torch.cat([
                 conv0_molecular_out,     # Particle-particle features
                 dense0_molecular_out,    # Direct particle features

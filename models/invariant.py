@@ -208,6 +208,10 @@ class DistanceBias(nn.Module):
 
     Returns `[B, n_heads, M, N]`, the shape `F.scaled_dot_product_attention`
     takes as a float `attn_mask`.
+
+    Initialised random, not zero -- see `__init__`.  That choice was measured,
+    and it is the difference between an `h` whose per-atom content is 1.2% and
+    pure atom identity, and one that carries conformation.
     """
 
     def __init__(self, n_heads: int, cutoff: float, num_basis: int = 16,
@@ -220,17 +224,37 @@ class DistanceBias(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden, self.n_heads),
         )
-        # Zero on the output layer, so at initialisation the bias is exactly 0
-        # and attention is the plain content attention.  The alternative -- a
-        # random bias over 470x470 pairs -- would hand the untrained model a
-        # strong arbitrary geometric prior, and the checkup in plan section 5.3
-        # reads activations *at random initialisation*, where that prior would
-        # be indistinguishable from signal.
+        # **Not zero-initialised, and the first version was.**  The reasoning
+        # for zero was that it keeps the untrained decoder at plain content
+        # attention and avoids handing it an arbitrary geometric prior.  The
+        # checkup measured what that costs (plan section 5.3, first run
+        # 2026-10-09): with a zero bias the per-atom fraction is 39.3% at
+        # `dense0_molecular` and 39.1% still at the decoder's `q_proj`, and
+        # then **1.175%** at `wp_tokens`.  And the per-atom part that survives
+        # is the same for two different conformations of the same molecule --
+        # cos +1.0000, where P009 measured 0.92-0.93 -- i.e. it is pure atom
+        # identity and carries no conformation at all.
+        #
+        # That is P009 10.7's closing conjecture, confirmed: "随机初始化时注意力
+        # logits 近乎均匀，于是每个 particle 拿到的上下文都 ≈ 全局均值,
+        # 输出对所有原子相同", listed there as "未验证的机械猜测" with an
+        # instruction not to treat it as settled.  It is settled now, and a
+        # zero distance bias is the strongest possible form of it: 470 query
+        # atoms attending to 7 super-particles with *nothing* distinguishing
+        # the pairs, so every atom receives the same mixture.
+        #
+        # A random bias is what makes the pair (i, j) matter at all, and
+        # "arbitrary geometric prior" was the wrong worry: the bias is a
+        # function of d_ij alone, so an untrained one is an arbitrary *radial*
+        # profile, which is exactly the inductive bias D1 set out to give the
+        # model in place of RoPE.  Zero-initialisation belongs on the injection
+        # into Protenix (where `W_h` and `dt_linear` are zero, so the fusion
+        # starts as the identity), not inside WorldParticle, whose output goes
+        # through that zero gate anyway.
         for m in self.net:
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
                 nn.init.zeros_(m.bias)
-        nn.init.zeros_(self.net[-1].weight)
 
     def forward(self, q_pos: torch.Tensor, kv_pos: torch.Tensor
                 ) -> torch.Tensor:
