@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import time
 from .cross_attn_feat import CrossAttentionWeightedPoswithFeature
-from .encodings.rope import ParticleRotaryEmbedding, freqs_to_cos_sin
+from .invariant import DistanceBias
 from .super_particle_layers import LocalFeatureExtractor, SuperParticleDecoder
 from TrajDataset import uses_obstacle_features, uses_topology_neighbors
 
@@ -59,6 +59,20 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
             other_feats_channels=0,
             obstacle_feats_channels=3,
 
+            # ============= Invariance Parameters (P011 D1) =============
+            # Range of the attention distance bias, in the same length unit as
+            # the positions (nm for Kineidos).  Unlike the convolution, whose
+            # pairs are bounded by the search radius, attention is all-to-all:
+            # two atoms can be the whole diameter of the molecule apart.  2.0
+            # nm covers GAGU's 470 heavy atoms (extent ~2.5 nm) with 16 centres
+            # 0.13 nm apart; beyond it the monotone tail channel of the RBF
+            # keeps "far" ordered rather than saturated (models/invariant.py).
+            # It is a length scale like particle_radius, so it is configured,
+            # not inferred.
+            distance_bias_cutoff=2.0,
+            distance_bias_num_basis=16,
+            normalize_other_feats=True,
+
             # ============= Debug Parameters =============
             verbose=False,
             velhead=False,
@@ -81,15 +95,17 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
         else:
             self.use_topology_conv = bool(use_topology_conv)
 
-        # ============ Store RoPE Configuration =============
+        # ============ RoPE is gone (P011 D1) =============
+        # `particle_position_rope_dim` is still accepted so that every existing
+        # caller and config keeps working, but nothing reads it: the two 3D
+        # RoPEs it sized have been replaced by distance biases, which have no
+        # per-head dimension to match.  The two asserts that used to live here
+        # constrained it to be divisible by 6 and to fit in a head -- both
+        # statements about RoPE, both now vacuous.
         self.particle_position_rope_dim = particle_position_rope_dim
-        
-        assert self.particle_position_rope_dim % 6 == 0, \
-            "particle_position_rope_dim must be divisible by 6 for 3D positions"
-            
-        assert self.particle_position_rope_dim <= cconv_embedding_dim * 3 // decoder_attn_heads, \
-            "RoPE dimension per head must be smaller than head dimension"
-            
+        self.distance_bias_cutoff = float(distance_bias_cutoff)
+        self.distance_bias_num_basis = int(distance_bias_num_basis)
+
         # ============= Continuous Convolution Configuration =============
         self.local_feature_extractor = LocalFeatureExtractor(
             kernel_size=kernel_size,
@@ -105,6 +121,7 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
             particle_radius=particle_radius,
             other_feats_channels=other_feats_channels,
             obstacle_feats_channels=obstacle_feats_channels,
+            normalize_other_feats=normalize_other_feats,
         )
         
         # ============= Calculate Feature Dimensions =============
@@ -123,17 +140,26 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
             iters=slot_attn_iters,
             n_heads=slot_attn_heads,
             eps=1e-8,
+            distance_bias_cutoff=self.distance_bias_cutoff,
+            distance_bias_num_basis=self.distance_bias_num_basis,
         )
 
-        # ============= Initialize RoPE Encodings =============
-        # RoPE for particle positions
-        self.particle_rope = ParticleRotaryEmbedding(
-            dim=self.particle_position_rope_dim
+        # ============= Distance biases for the decoder (P011 D1(c)) =========
+        # These two replace `particle_rope` and `super_particle_rope`.  Two
+        # modules rather than one because the pairs are different kinds --
+        # atom-to-super-particle for the cross-attention, atom-to-atom for the
+        # self-attention -- and sharing weights would force one radial profile
+        # on both.  Both are zero-initialised on their output layer, so at
+        # random initialisation the decoder is exactly content attention.
+        self.decoder_cross_bias = DistanceBias(
+            n_heads=decoder_attn_heads,
+            cutoff=self.distance_bias_cutoff,
+            num_basis=self.distance_bias_num_basis,
         )
-
-        # RoPE for super-particle positions
-        self.super_particle_rope = ParticleRotaryEmbedding(
-            dim=self.particle_position_rope_dim
+        self.decoder_self_bias = DistanceBias(
+            n_heads=decoder_attn_heads,
+            cutoff=self.distance_bias_cutoff,
+            num_basis=self.distance_bias_num_basis,
         )
         
         # ============= Initialize Super-Particle Decoder =============
@@ -373,25 +399,23 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
             print(f"Slot attention time: {t4 - t3:.4f} seconds")
             import pdb; pdb.set_trace()
 
-        # ============= Step 4: Compute RoPE Embeddings =============
-
-        # Generate RoPE for particle positions
-        rope_freqs = self.particle_rope(pos_batch)
-        particle_rope_cos, particle_rope_sin = freqs_to_cos_sin(
-            rope_freqs,
-            head_dim=self.super_particle_decoder.head_dim
+        # ============= Step 4: Compute the decoder's distance biases =========
+        # P011 D1(c).  Was two 3D RoPEs over absolute positions.  Computed once
+        # here and shared across all decoder layers: positions do not change
+        # inside the decoder.  The super-particle positions come from ToMe's
+        # weighted mean of the merged particles' positions, which is
+        # equivariant, so a distance to them is invariant.
+        decoder_cross_bias = self.decoder_cross_bias(
+            pos_batch, super_particle_positions_batch
         )
-        
-        # Generate RoPE for super-particle positions
-        rope_super_particle_freqs = self.super_particle_rope(super_particle_positions_batch)
-        super_particle_rope_cos, super_particle_rope_sin = freqs_to_cos_sin(
-            rope_super_particle_freqs,
-            head_dim=self.super_particle_decoder.head_dim
+        decoder_self_bias = (
+            self.decoder_self_bias(pos_batch, pos_batch)
+            if self.super_particle_decoder.layers[0].enable_self_attn else None
         )
 
         t5 = time.time()
         if self.verbose:
-            print(f"RoPE computation time: {t5 - t4:.4f} seconds")
+            print(f"Distance bias computation time: {t5 - t4:.4f} seconds")
             import pdb; pdb.set_trace()
 
         # ============= Step 6: Super-Particle Decoder Processing =============
@@ -399,10 +423,8 @@ class ParticleNetworkCrossAttnLocalFeature(torch.nn.Module):
         output_features = self.super_particle_decoder(
             particles_feat=particle_features_batch, # query
             super_particles_feat=super_particle_features_batch, # kv
-            rope_cos=particle_rope_cos,
-            rope_sin=particle_rope_sin,
-            rope_ctx_cos=super_particle_rope_cos,
-            rope_ctx_sin=super_particle_rope_sin,
+            cross_attn_bias=decoder_cross_bias,
+            self_attn_bias=decoder_self_bias,
         )
 
         t6 = time.time()

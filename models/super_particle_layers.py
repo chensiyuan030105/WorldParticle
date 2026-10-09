@@ -3,6 +3,7 @@ import torch.nn as nn
 from .layers.attention import MultiHeadAttention, FeedForwardGeLU, FeedForwardSwiGLU
 from .encodings.rms_norm import RMSNorm
 from .continuous_conv import ContinuousConv, ParticleRadiusResearch, FixedRadiusSearch
+from .invariant import RadialMessagePassing
 from open3d.ml.torch.ops import reduce_subarrays_sum
 import numpy as np
 import math
@@ -149,6 +150,7 @@ class LocalFeatureExtractor(torch.nn.Module):
             other_feats_channels=0,
             obstacle_feats_channels=3,
             topology_blend_alpha=None,
+            normalize_other_feats=True,
     ):
         super().__init__()
 
@@ -234,19 +236,38 @@ class LocalFeatureExtractor(torch.nn.Module):
             molecular_conv_out_channels = cconv_embedding_dim // 2
             topology_conv_out_channels = cconv_embedding_dim // 2
 
-        self.conv0_molecular = Conv(
+        # P011 D1(a).  Was `Conv(...)`, i.e. open3d's ContinuousConv, which
+        # indexes a fixed-orientation 4x4x4 kernel by the neighbour's relative
+        # offset *vector* -- rotate the molecule and a neighbour lands in a
+        # different cell.  `RadialMessagePassing` keeps the same neighbour
+        # lists, the same window function and the same forward signature, and
+        # reads only ||p_i - p_j||.  See models/invariant.py.
+        #
+        # The RBF spans [0, search radius], not [0, filter_extent]:
+        # ParticleRadiusResearch searches at `0.5 * extents`
+        # (continuous_conv.py:313), so no pair is ever farther apart than half
+        # the filter extent and centres beyond that would never be reached.
+        # (The plan's section 4 said `[0, filter_extent]`; corrected in v0.2.)
+        self.conv0_molecular = RadialMessagePassing(
             in_channels=4 + other_feats_channels,
             filters=molecular_conv_out_channels,
-            activation=None
+            cutoff=float(self.filter_extent) * 0.5,
         )
         if self.use_topology_conv:
-            self.conv0_topology = Conv(
+            self.conv0_topology = RadialMessagePassing(
                 in_channels=4 + other_feats_channels,
                 filters=topology_conv_out_channels,
-                activation=None
+                cutoff=float(self.topology_filter_extent) * 0.5,
             )
 
-        # Molecular-obstacle convolution: particle-boundary interactions
+        # Molecular-obstacle convolution: particle-boundary interactions.
+        # Deliberately still a ContinuousConv, i.e. still not rotation
+        # invariant.  `uses_obstacle_features("molecular")` is False, so for
+        # every Kineidos arm this branch is not built at all, and converting a
+        # code path this plan cannot run or test would be a change nobody has
+        # measured.  Anything that does turn obstacle data on in `wp-v3` has to
+        # redo the symmetry probe in section 4 first.  Same for the unused
+        # `SuperParticleLocalFeatureExtractor` below.
         if uses_obstacle_features(self.data):
             self.conv0_obstacle = Conv(
                 in_channels=obstacle_feats_channels,
@@ -263,6 +284,31 @@ class LocalFeatureExtractor(torch.nn.Module):
         )
         nn.init.xavier_uniform_(self.dense0_molecular.weight)
         nn.init.zeros_(self.dense0_molecular.bias)
+
+        # P011 D2 / STAR-MD A12.  The particle feature vector is a concat of
+        # branches on wildly different scales, and both the conv and dense0
+        # consume it: P009 10.7 measured `ones` = 1.0 against velocities of
+        # 1.8-2.7e-4, i.e. 5000:1, and the per-atom part of dense0's output was
+        # 1.57e-07 of its magnitude -- the two constant channels decided the
+        # layer by themselves.  STAR-MD hit the same bug at 220:1 and fixed it
+        # by normalising each branch *before* the concat; a norm after it
+        # "cannot undo the imbalance".
+        #
+        # Only `other_feats` gets a LayerNorm.  Not the other two, for reasons
+        # rather than by omission:
+        #   * `ones` is upstream's deliberate bias channel for the convolution
+        #     (the comment at the concat says so).  It is one channel with zero
+        #     variance, so a LayerNorm over it returns exactly beta and the
+        #     bias is destroyed.  It is also the reference scale -- rms 1.0 is
+        #     what the other branches are being normalised *to*.
+        #   * the velocity slot is fed zeros under this plan's contract (D2),
+        #     so there is nothing to normalise; it is kept rather than removed
+        #     so that in_channels, and therefore the state_dict, is unchanged.
+        self.normalize_other_feats = bool(normalize_other_feats)
+        if self.normalize_other_feats and other_feats_channels > 0:
+            self.other_feats_norm = nn.LayerNorm(other_feats_channels)
+        else:
+            self.other_feats_norm = None
         
         self.register_buffer(
             "filter_extent_tensor",
@@ -273,6 +319,27 @@ class LocalFeatureExtractor(torch.nn.Module):
             torch.tensor(self.topology_filter_extent, dtype=torch.float32)
         )
     
+    def _prepare_other_feats(self, other_feats):
+        """Shape-fix and per-branch normalise the `other_feats` branch.
+
+        P011 D2.  See the constructor for why this branch and not the other
+        two.  The LayerNorm runs over channels, per particle, so it equalises
+        the branch against `ones` without erasing which atom is which.
+        """
+        if other_feats.dim() == 1:
+            other_feats = other_feats.unsqueeze(-1)
+        if other_feats.shape[-1] != self.other_feats_channels:
+            raise ValueError(
+                f"other_feats has {other_feats.shape[-1]} channels but this "
+                f"LocalFeatureExtractor was built for "
+                f"{self.other_feats_channels}. The channel count is a "
+                f"constructor argument, so a mismatch means the bridge and the "
+                f"model disagree about the feature contract (plan section 5.1)."
+            )
+        if self.other_feats_norm is not None:
+            other_feats = self.other_feats_norm(other_feats)
+        return other_feats
+
     def forward(self, inp_pos, query_pos, inp_vel, other_feats, 
                 box=None, 
                 box_feats=None, 
@@ -287,8 +354,7 @@ class LocalFeatureExtractor(torch.nn.Module):
         if self.is_local_molecular:
             molecular_feats = [torch.ones_like(inp_pos[:, 0:1]), inp_vel, inp_pos]
             if other_feats is not None:
-                if other_feats.dim() == 1:
-                    other_feats = other_feats.unsqueeze(-1)
+                other_feats = self._prepare_other_feats(other_feats)
                 molecular_feats.append(other_feats)
             molecular_feats = torch.cat(molecular_feats, axis=-1)
             dense0_molecular_out = self.dense0_molecular(molecular_feats)
@@ -354,10 +420,19 @@ class LocalFeatureExtractor(torch.nn.Module):
         # Prepare molecular particle features: [1, velocities, other_features]
         molecular_feats = [torch.ones_like(inp_pos[:, 0:1]), inp_vel]  # Add constant feature for bias
         if other_feats is not None:
-            if other_feats.dim() == 1:
-                other_feats = other_feats.unsqueeze(-1)
+            other_feats = self._prepare_other_feats(other_feats)
             molecular_feats.append(other_feats)
         molecular_feats = torch.cat(molecular_feats, axis=-1)
+        # Reported by kineidos/probe_wp_content.py (plan section 4, item 4):
+        # the per-branch rms values that D2's imbalance is about.
+        self._branch_rms = {
+            "ones": 1.0,
+            "vel": float(inp_vel.detach().float().pow(2).mean().sqrt()),
+            "other_feats": (
+                float(other_feats.detach().float().pow(2).mean().sqrt())
+                if other_feats is not None else float("nan")
+            ),
+        }
 
         # Extract molecular branch first when required by fusion mode.
         conv0_molecular_out = None
@@ -757,10 +832,8 @@ class SuperParticleDecoderLayer(nn.Module):
         self,
         query: torch.Tensor,
         kv: torch.Tensor,
-        rope_cos: torch.Tensor = None,
-        rope_sin: torch.Tensor = None,
-        rope_ctx_cos: torch.Tensor = None,
-        rope_ctx_sin: torch.Tensor = None,
+        cross_attn_bias: torch.Tensor = None,
+        self_attn_bias: torch.Tensor = None,
     ):
         """
         Forward pass of the decoder layer.
@@ -768,13 +841,24 @@ class SuperParticleDecoderLayer(nn.Module):
         Args:
             query: Query particle features [B, N_query, query_dim]
             kv: Super-particle features (keys/values) [B, N_super, super_dim]
-            rope_cos: Cosine RoPE embeddings for queries
-            rope_sin: Sine RoPE embeddings for queries
-            rope_ctx_cos: Cosine RoPE embeddings for keys/values
-            rope_ctx_sin: Sine RoPE embeddings for keys/values
+            cross_attn_bias: [B, H, N_query, N_super] additive logit bias from
+                the query-atom-to-super-particle distances (P011 D1(c)).
+            self_attn_bias: [B, H, N_query, N_query] additive logit bias from
+                the atom-atom distances.
 
         Returns:
             Updated query particle features [B, N_query, query_dim]
+
+        P011 D1(c).  Upstream passed four RoPE tensors here, built from the
+        query atoms' and the super-particles' absolute positions
+        (`particle_rope` / `super_particle_rope`), and used them in *both* the
+        cross-attention and the self-attention.  3D RoPE reads the lab-frame x,
+        y and z components, so those were two of the three places where
+        `h(Rx) != h(x)`.  Both are now additive per-head biases over pair
+        distances.  The self-attention gets one too: dropping its RoPE without
+        a replacement would leave eight layers of attention among 470 atoms
+        with no geometry at all, which is a larger change in what the model
+        *can* represent than this plan intends to make.
         """
         # ============= Cross-Attention Block =============
         # Query particles attend to super-particles
@@ -787,10 +871,7 @@ class SuperParticleDecoderLayer(nn.Module):
             k=kv_normed,
             v=kv_normed,
             src_key_padding_mask=None,
-            rope_cos=rope_cos,
-            rope_sin=rope_sin,
-            rope_ctx_cos=rope_ctx_cos,
-            rope_ctx_sin=rope_ctx_sin
+            attn_bias=cross_attn_bias,
         )
 
         query = residual + self.dropout(cross_attn_output)
@@ -806,10 +887,7 @@ class SuperParticleDecoderLayer(nn.Module):
                 k=q,
                 v=q,
                 src_key_padding_mask=None,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                rope_ctx_cos=None,
-                rope_ctx_sin=None
+                attn_bias=self_attn_bias,
             )
             query = residual + self.dropout(self_attn_output)
 
@@ -897,18 +975,17 @@ class SuperParticleDecoder(nn.Module):
         self,
         super_particles_feat: torch.Tensor,
         particles_feat: torch.Tensor,
-        rope_cos: torch.Tensor,
-        rope_sin: torch.Tensor,
-        rope_ctx_cos: torch.Tensor,
-        rope_ctx_sin: torch.Tensor,
+        cross_attn_bias: torch.Tensor = None,
+        self_attn_bias: torch.Tensor = None,
     ):
+        # Both biases are computed once by the caller and shared across layers:
+        # positions do not change inside the decoder, so recomputing them per
+        # layer would cost eight times as much for the same numbers.
         for idx, layer in enumerate(self.layers):
             particles_feat = layer(
                 query=particles_feat,
                 kv=super_particles_feat,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                rope_ctx_cos=rope_ctx_cos,
-                rope_ctx_sin=rope_ctx_sin,
+                cross_attn_bias=cross_attn_bias,
+                self_attn_bias=self_attn_bias,
             )
         return particles_feat

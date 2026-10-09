@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-from .encodings.rope import ParticleRotaryEmbedding, freqs_to_cos_sin
+from .invariant import DistanceBias
 from .layers.attention import  MultiHeadAttentionWithTOME
 
 class CrossAttentionWeightedPoswithFeature(nn.Module):
@@ -12,8 +12,11 @@ class CrossAttentionWeightedPoswithFeature(nn.Module):
         n_heads: int = 6,
         iters: int = 3,
         eps: float = 1e-8,
-        use_rope: bool = True,  # Make RoPE optional
+        use_rope: bool = True,  # kept as the switch name; now selects the
+                                # distance bias, see below
         dropout: float = 0.1,
+        distance_bias_cutoff: float = 2.0,
+        distance_bias_num_basis: int = 16,
     ):
         super().__init__()
         self.dim = dim
@@ -23,14 +26,26 @@ class CrossAttentionWeightedPoswithFeature(nn.Module):
         self.eps = eps
         self.nh_f = n_heads
         self.use_rope = use_rope
-        
-        # RoPE (3D) for inputs & slots - optional
+
+        # P011 D1(b).  `wp-v2` built a 3D `ParticleRotaryEmbedding` here and
+        # recomputed it from the current positions on every ToMe iteration,
+        # which is one of the three reasons `h(Rx) != h(x)` (P004 2.9.1:
+        # residual 0.999).  Replaced by a per-head additive bias over the pair
+        # distances, recomputed on the same schedule and from the same
+        # positions -- so the geometry still reaches attention, but through a
+        # rotation invariant.  `use_rope` keeps its name because it is still
+        # the same switch ("does attention see geometry at all"), and renaming
+        # it would quietly break any caller that sets it.
         if self.use_rope:
             dh_f = dim // n_heads
             assert dh_f * n_heads == dim, "dim must be divisible by n_heads"
             self.dh_f = dh_f
-            self.input_rope = ParticleRotaryEmbedding(dim=dh_f)
-            
+            self.distance_bias = DistanceBias(
+                n_heads=n_heads,
+                cutoff=distance_bias_cutoff,
+                num_basis=distance_bias_num_basis,
+            )
+
         # ---------- content head projections (features) ----------
         self.self_attn_with_tome = nn.ModuleList()
         for _ in range(self.iters):
@@ -94,10 +109,10 @@ class CrossAttentionWeightedPoswithFeature(nn.Module):
         trace_source = None
         
         for _iter in range(self.iters):
-            # Update RoPE embedding with current positions at each iteration
+            # Recomputed from the current (merged) positions at each iteration,
+            # exactly where the RoPE used to be.
             if self.use_rope:
-                rope_ctx = self.input_rope(pos_batch)
-                rope_cos, rope_sin = freqs_to_cos_sin(rope_ctx, head_dim=self.dh_f)
+                attn_bias = self.distance_bias(pos_batch, pos_batch)
 
             # Calculate number of tokens to remove (with safety check)
             current_num_tokens = feat.shape[1]
@@ -111,8 +126,9 @@ class CrossAttentionWeightedPoswithFeature(nn.Module):
                 num_to_remove_tokens=num_to_remove_tokens,
                 size_token=size_token,
                 src_key_padding_mask=None,
-                rope_cos=rope_cos if self.use_rope else None,
-                rope_sin=rope_sin if self.use_rope else None,
+                rope_cos=None,
+                rope_sin=None,
+                attn_bias=attn_bias if self.use_rope else None,
                 is_trace_source=True,
                 k_partite=k_partite,
                 trace_source=trace_source,

@@ -117,8 +117,13 @@ class MultiHeadAttention(nn.Module):
             self.q_norm = nn.Identity()
             self.k_norm = nn.Identity()
 
-    def forward(self, q, k, v, src_key_padding_mask=None, rope_cos=None, rope_sin=None, rope_ctx_cos=None, rope_ctx_sin=None, force_sdpa=False):
+    def forward(self, q, k, v, src_key_padding_mask=None, rope_cos=None, rope_sin=None, rope_ctx_cos=None, rope_ctx_sin=None, force_sdpa=False,
+                attn_bias=None):
         # src_key_padding_mask: (B, N), key padding mask, things you want to attend to is True
+        # attn_bias: (B, H, src_len, ctx_len), added to the logits.  P011 D1:
+        # this is what replaces 3D RoPE -- see models/invariant.py.
+        if attn_bias is not None:
+            force_sdpa = True   # flash_attn takes no additive bias
         bs, src_len = q.shape[0], q.shape[1]
         ctx_len = k.shape[1]
 
@@ -163,6 +168,19 @@ class MultiHeadAttention(nn.Module):
                 attn_mask = attn_mask.view(bs, self.num_heads, -1, ctx_len)
             else:
                 attn_mask = None
+
+            if attn_bias is not None:
+                if attn_mask is not None:
+                    # A bool mask and a float bias cannot both be `attn_mask`.
+                    # Raising beats guessing: the only caller with a bias has no
+                    # padding mask, and a silent choice here would be a quiet
+                    # change of semantics.
+                    raise NotImplementedError(
+                        "attn_bias together with src_key_padding_mask is not "
+                        "supported; convert the mask to -inf and add it to the "
+                        "bias at the call site"
+                    )
+                attn_mask = attn_bias.to(dtype=q.dtype)
 
             attn_output = F.scaled_dot_product_attention(
                 query=q.type(v.dtype),
@@ -745,9 +763,17 @@ class MultiHeadAttentionWithTOME(nn.Module):
                 is_trace_source=False, 
                 trace_source=None,
                 force_sdpa=False,
-                k_partite=-1):
+                k_partite=-1,
+                attn_bias=None):
         
         # src_key_padding_mask: (B, N), key padding mask, things you want to attend to is True
+        # attn_bias: (B, H, N, N), added to the logits.  P011 D1: this is what
+        # replaces the slot attention's 3D RoPE -- see models/invariant.py.
+        # ToMe is unaffected by construction: `metric` below is k, which comes
+        # from the (invariant) content features, so the merge decisions and
+        # therefore the super-particle groupings stay invariant too.
+        if attn_bias is not None:
+            force_sdpa = True   # flash_attn takes no additive bias
         bs, src_len = query.shape[0], query.shape[1]
         
         q = self.query_norm(query)
@@ -787,6 +813,15 @@ class MultiHeadAttentionWithTOME(nn.Module):
                 attn_mask = attn_mask.view(bs, self.num_heads, -1, ctx_len)
             else:
                 attn_mask = None
+
+            if attn_bias is not None:
+                if attn_mask is not None:
+                    raise NotImplementedError(
+                        "attn_bias together with src_key_padding_mask is not "
+                        "supported; convert the mask to -inf and add it to the "
+                        "bias at the call site"
+                    )
+                attn_mask = attn_bias.to(dtype=q.dtype)
 
             attn_output = F.scaled_dot_product_attention(
                 query=q.type(v.dtype),
